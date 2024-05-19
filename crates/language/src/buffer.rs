@@ -75,6 +75,8 @@ pub enum Capability {
     ReadOnly,
 }
 
+pub type BufferRow = u32;
+
 /// An in-memory representation of a source code file, including its text,
 /// syntax trees, git status, and diagnostics.
 pub struct Buffer {
@@ -477,6 +479,7 @@ pub struct Chunk<'a> {
 }
 
 /// A set of edits to a given version of a buffer, computed asynchronously.
+#[derive(Debug)]
 pub struct Diff {
     pub(crate) base_version: clock::Global,
     line_ending: LineEnding,
@@ -1524,14 +1527,10 @@ impl Buffer {
         self.end_transaction(cx)
     }
 
-    fn changed_since_saved_version(&self) -> bool {
-        self.edits_since::<usize>(&self.saved_version)
-            .next()
-            .is_some()
-    }
     /// Checks if the buffer has unsaved changes.
     pub fn is_dirty(&self) -> bool {
-        (self.has_conflict || self.changed_since_saved_version())
+        self.has_conflict
+            || self.has_edits_since(&self.saved_version)
             || self
                 .file
                 .as_ref()
@@ -1541,11 +1540,10 @@ impl Buffer {
     /// Checks if the buffer and its file have both changed since the buffer
     /// was last saved or reloaded.
     pub fn has_conflict(&self) -> bool {
-        (self.has_conflict || self.changed_since_saved_version())
-            && self
-                .file
-                .as_ref()
-                .map_or(false, |file| file.mtime() > self.saved_mtime)
+        self.has_conflict
+            || self.file.as_ref().map_or(false, |file| {
+                file.mtime() > self.saved_mtime && self.has_edits_since(&self.saved_version)
+            })
     }
 
     /// Gets a [`Subscription`] that tracks all of the changes to the buffer's text.
@@ -3104,7 +3102,7 @@ impl BufferSnapshot {
     /// row range.
     pub fn git_diff_hunks_in_row_range(
         &self,
-        range: Range<u32>,
+        range: Range<BufferRow>,
     ) -> impl '_ + Iterator<Item = git::diff::DiffHunk<u32>> {
         self.git_diff.hunks_in_row_range(range, self)
     }
@@ -3157,7 +3155,21 @@ impl BufferSnapshot {
                 .iter_mut()
                 .enumerate()
                 .flat_map(|(ix, iter)| Some((ix, iter.peek()?)))
-                .min_by(|(_, a), (_, b)| a.range.start.cmp(&b.range.start))?;
+                .min_by(|(_, a), (_, b)| {
+                    let cmp = a
+                        .range
+                        .start
+                        .cmp(&b.range.start)
+                        // when range is equal, sort by diagnostic severity
+                        .then(a.diagnostic.severity.cmp(&b.diagnostic.severity))
+                        // and stabilize order with group_id
+                        .then(a.diagnostic.group_id.cmp(&b.diagnostic.group_id));
+                    if reversed {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    }
+                })?;
             iterators[next_ix].next()
         })
     }

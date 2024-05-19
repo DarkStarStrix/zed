@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use futures::AsyncReadExt;
+use http::HttpClient;
 use semver::Version;
 use serde::Deserialize;
 use smol::io::BufReader;
@@ -15,7 +16,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::http::HttpClient;
 use util::ResultExt;
 
 #[cfg(windows)]
@@ -266,8 +266,21 @@ impl NodeRuntime for RealNodeRuntime {
                 command.args(["--prefix".into(), directory.to_path_buf()]);
             }
 
+            if let Some(proxy) = self.http.proxy() {
+                command.args(["--proxy", proxy]);
+            }
+
             #[cfg(windows)]
-            command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+            {
+                // SYSTEMROOT is a critical environment variables for Windows.
+                if let Some(val) = std::env::var("SYSTEMROOT")
+                    .context("Missing environment variable: SYSTEMROOT!")
+                    .log_err()
+                {
+                    command.env("SYSTEMROOT", val);
+                }
+                command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+            }
 
             command.output().await.map_err(|e| anyhow!("{e}"))
         };

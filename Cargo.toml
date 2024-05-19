@@ -41,6 +41,7 @@ members = [
     "crates/gpui",
     "crates/gpui_macros",
     "crates/headless",
+    "crates/http",
     "crates/image_viewer",
     "crates/inline_completion_button",
     "crates/install_cli",
@@ -127,6 +128,7 @@ members = [
     "extensions/php",
     "extensions/prisma",
     "extensions/purescript",
+    "extensions/ruby",
     "extensions/svelte",
     "extensions/terraform",
     "extensions/toml",
@@ -182,6 +184,7 @@ google_ai = { path = "crates/google_ai" }
 gpui = { path = "crates/gpui" }
 gpui_macros = { path = "crates/gpui_macros" }
 headless = { path = "crates/headless" }
+http = { path = "crates/http" }
 install_cli = { path = "crates/install_cli" }
 image_viewer = { path = "crates/image_viewer" }
 inline_completion_button = { path = "crates/inline_completion_button" }
@@ -262,6 +265,7 @@ bitflags = "2.4.2"
 blade-graphics = { git = "https://github.com/kvark/blade", rev = "e35b2d41f221a48b75f7cf2e78a81e7ecb7a383c" }
 blade-macros = { git = "https://github.com/kvark/blade", rev = "e35b2d41f221a48b75f7cf2e78a81e7ecb7a383c" }
 cap-std = "3.0"
+cargo_toml = "0.20"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 clickhouse = { version = "0.11.6" }
@@ -313,7 +317,7 @@ refineable = { path = "./crates/refineable" }
 regex = "1.5"
 repair_json = "0.1.0"
 rusqlite = { version = "0.29.0", features = ["blob", "array", "modern_sqlite"] }
-rust-embed = { version = "8.0", features = ["include-exclude"] }
+rust-embed = { version = "8.4", features = ["include-exclude"] }
 schemars = "0.8"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -333,7 +337,7 @@ subtle = "2.5.0"
 sysinfo = "0.30.7"
 tempfile = "3.9.0"
 thiserror = "1.0.29"
-tiktoken-rs = "0.5.7"
+tiktoken-rs = "0.5.9"
 time = { version = "0.3", features = [
     "macros",
     "parsing",
@@ -387,7 +391,7 @@ wit-component = "0.201"
 sys-locale = "0.3.1"
 
 [workspace.dependencies.windows]
-version = "0.53.0"
+version = "0.56.0"
 features = [
     "implement",
     "Foundation_Numerics",
@@ -398,11 +402,11 @@ features = [
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Imaging_D2D",
-    "Win32_Media",
     "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
