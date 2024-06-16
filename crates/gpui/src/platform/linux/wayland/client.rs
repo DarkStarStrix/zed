@@ -63,7 +63,9 @@ use crate::platform::linux::is_within_click_distance;
 use crate::platform::linux::wayland::cursor::Cursor;
 use crate::platform::linux::wayland::serial::{SerialKind, SerialTracker};
 use crate::platform::linux::wayland::window::WaylandWindow;
-use crate::platform::linux::xdg_desktop_portal::{Event as XDPEvent, XDPEventSource};
+use crate::platform::linux::xdg_desktop_portal::{
+    cursor_settings, Event as XDPEvent, XDPEventSource,
+};
 use crate::platform::linux::LinuxClient;
 use crate::platform::PlatformWindow;
 use crate::{
@@ -139,8 +141,9 @@ impl Globals {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InProgressOutput {
+    name: Option<String>,
     scale: Option<i32>,
     position: Option<Point<DevicePixels>>,
     size: Option<Size<DevicePixels>>,
@@ -151,6 +154,7 @@ impl InProgressOutput {
         if let Some((position, size)) = self.position.zip(self.size) {
             let scale = self.scale.unwrap_or(1);
             Some(Output {
+                name: self.name.clone(),
                 scale,
                 bounds: Bounds::new(position, size),
             })
@@ -160,20 +164,11 @@ impl InProgressOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Output {
+    pub name: Option<String>,
     pub scale: i32,
     pub bounds: Bounds<DevicePixels>,
-}
-
-impl Hash for Output {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_i32(self.scale);
-        state.write_i32(self.bounds.origin.x.0);
-        state.write_i32(self.bounds.origin.y.0);
-        state.write_i32(self.bounds.size.width.0);
-        state.write_i32(self.bounds.size.height.0);
-    }
 }
 
 pub(crate) struct WaylandClientState {
@@ -337,7 +332,6 @@ impl Drop for WaylandClient {
 }
 
 const WL_DATA_DEVICE_MANAGER_VERSION: u32 = 3;
-const WL_OUTPUT_VERSION: u32 = 2;
 
 fn wl_seat_version(version: u32) -> u32 {
     // We rely on the wl_pointer.frame event
@@ -352,6 +346,20 @@ fn wl_seat_version(version: u32) -> u32 {
     }
 
     version.clamp(WL_SEAT_MIN_VERSION, WL_SEAT_MAX_VERSION)
+}
+
+fn wl_output_version(version: u32) -> u32 {
+    const WL_OUTPUT_MIN_VERSION: u32 = 2;
+    const WL_OUTPUT_MAX_VERSION: u32 = 4;
+
+    if version < WL_OUTPUT_MIN_VERSION {
+        panic!(
+            "wl_output below required version: {} < {}",
+            version, WL_OUTPUT_MIN_VERSION
+        );
+    }
+
+    version.clamp(WL_OUTPUT_MIN_VERSION, WL_OUTPUT_MAX_VERSION)
 }
 
 impl WaylandClient {
@@ -378,7 +386,7 @@ impl WaylandClient {
                     "wl_output" => {
                         let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
                             global.name,
-                            WL_OUTPUT_VERSION,
+                            wl_output_version(global.version),
                             &qh,
                             (),
                         );
@@ -397,9 +405,14 @@ impl WaylandClient {
 
         let handle = event_loop.handle();
         handle
-            .insert_source(main_receiver, |event, _, _: &mut WaylandClientStatePtr| {
-                if let calloop::channel::Event::Msg(runnable) = event {
-                    runnable.run();
+            .insert_source(main_receiver, {
+                let handle = handle.clone();
+                move |event, _, _: &mut WaylandClientStatePtr| {
+                    if let calloop::channel::Event::Msg(runnable) = event {
+                        handle.insert_idle(|_| {
+                            runnable.run();
+                        });
+                    }
                 }
             })
             .unwrap();
@@ -419,7 +432,7 @@ impl WaylandClient {
 
         let (primary, clipboard) = unsafe { create_clipboards_from_external(display) };
 
-        let cursor = Cursor::new(&conn, &globals, 24);
+        let mut cursor = Cursor::new(&conn, &globals, 24);
 
         handle
             .insert_source(XDPEventSource::new(&common.background_executor), {
@@ -435,9 +448,23 @@ impl WaylandClient {
                             }
                         }
                     }
+                    XDPEvent::CursorTheme(theme) => {
+                        if let Some(client) = client.0.upgrade() {
+                            let mut client = client.borrow_mut();
+                            client.cursor.set_theme(theme.as_str(), None);
+                        }
+                    }
+                    XDPEvent::CursorSize(size) => {
+                        if let Some(client) = client.0.upgrade() {
+                            let mut client = client.borrow_mut();
+                            client.cursor.set_size(size);
+                        }
+                    }
                 }
             })
             .unwrap();
+
+        let foreground = common.foreground_executor.clone();
 
         let mut state = Rc::new(RefCell::new(WaylandClientState {
             serial_tracker: SerialTracker::new(),
@@ -500,6 +527,18 @@ impl WaylandClient {
             pending_open_uri: None,
         }));
 
+        foreground
+            .spawn({
+                let state = state.clone();
+                async move {
+                    if let Ok((theme, size)) = cursor_settings().await {
+                        let mut state = state.borrow_mut();
+                        state.cursor.set_theme(theme.as_str(), size);
+                    }
+                }
+            })
+            .detach();
+
         WaylandSource::new(conn, event_queue)
             .insert(handle)
             .unwrap();
@@ -517,7 +556,8 @@ impl LinuxClient for WaylandClient {
             .map(|(id, output)| {
                 Rc::new(WaylandDisplay {
                     id: id.clone(),
-                    bounds: output.bounds,
+                    name: output.name.clone(),
+                    bounds: output.bounds.to_pixels(output.scale as f32),
                 }) as Rc<dyn PlatformDisplay>
             })
             .collect()
@@ -532,7 +572,8 @@ impl LinuxClient for WaylandClient {
                 (object_id.protocol_id() == id.0).then(|| {
                     Rc::new(WaylandDisplay {
                         id: object_id.clone(),
-                        bounds: output.bounds,
+                        name: output.name.clone(),
+                        bounds: output.bounds.to_pixels(output.scale as f32),
                     }) as Rc<dyn PlatformDisplay>
                 })
             })
@@ -546,7 +587,7 @@ impl LinuxClient for WaylandClient {
         &self,
         handle: AnyWindowHandle,
         params: WindowParams,
-    ) -> Box<dyn PlatformWindow> {
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
 
         let (window, surface_id) = WaylandWindow::new(
@@ -555,10 +596,10 @@ impl LinuxClient for WaylandClient {
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
             params,
             state.common.appearance,
-        );
+        )?;
         state.windows.insert(surface_id, window.0.clone());
 
-        Box::new(window)
+        Ok(Box::new(window))
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
@@ -680,6 +721,10 @@ impl LinuxClient for WaylandClient {
             .as_ref()
             .map(|window| window.handle())
     }
+
+    fn compositor_name(&self) -> &'static str {
+        "Wayland"
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStatePtr {
@@ -716,8 +761,12 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     );
                 }
                 "wl_output" => {
-                    let output =
-                        registry.bind::<wl_output::WlOutput, _, _>(name, WL_OUTPUT_VERSION, qh, ());
+                    let output = registry.bind::<wl_output::WlOutput, _, _>(
+                        name,
+                        wl_output_version(version),
+                        qh,
+                        (),
+                    );
 
                     state
                         .in_progress_outputs
@@ -821,6 +870,9 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
         };
 
         match event {
+            wl_output::Event::Name { name } => {
+                in_progress_output.name = Some(name);
+            }
             wl_output::Event::Scale { factor } => {
                 in_progress_output.scale = Some(factor);
             }
@@ -1057,13 +1109,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
-                let Some(focused_window) = focused_window else {
-                    return;
-                };
 
                 let keymap_state = state.keymap_state.as_mut().unwrap();
                 keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 state.modifiers = Modifiers::from_xkb(keymap_state);
+
+                let Some(focused_window) = focused_window else {
+                    return;
+                };
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
