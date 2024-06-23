@@ -31,6 +31,7 @@ use gpui::{
 };
 use ignore::IgnoreStack;
 use parking_lot::Mutex;
+use paths::local_settings_folder_relative_path;
 use postage::{
     barrier,
     prelude::{Sink as _, Stream as _},
@@ -58,7 +59,7 @@ use std::{
 };
 use sum_tree::{Bias, Edit, SeekTarget, SumTree, TreeMap, TreeSet};
 use text::{LineEnding, Rope};
-use util::{paths::HOME, ResultExt};
+use util::{paths::home_dir, ResultExt};
 pub use worktree_settings::WorktreeSettings;
 
 #[cfg(feature = "test-support")]
@@ -2589,6 +2590,7 @@ impl BackgroundScannerState {
     fn should_scan_directory(&self, entry: &Entry) -> bool {
         (!entry.is_external && !entry.is_ignored)
             || entry.path.file_name() == Some(*DOT_GIT)
+            || entry.path.file_name() == Some(local_settings_folder_relative_path().as_os_str())
             || self.scanned_dirs.contains(&entry.id) // If we've ever scanned it, keep scanning
             || self
                 .paths_to_scan
@@ -2968,9 +2970,9 @@ impl language::File for File {
         } else {
             let path = worktree.abs_path();
 
-            if worktree.is_local() && path.starts_with(HOME.as_path()) {
+            if worktree.is_local() && path.starts_with(home_dir().as_path()) {
                 full_path.push("~");
-                full_path.push(path.strip_prefix(HOME.as_path()).unwrap());
+                full_path.push(path.strip_prefix(home_dir().as_path()).unwrap());
             } else {
                 full_path.push(path)
             }
