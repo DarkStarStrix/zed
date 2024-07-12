@@ -56,11 +56,11 @@ use crate::zed::inline_completion_registry;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn fail_to_launch(e: anyhow::Error) {
-    eprintln!("Zed failed to launch: {:?}", e);
+    eprintln!("Zed failed to launch: {e:?}");
     App::new().run(move |cx| {
         if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |cx| cx.new_view(|_| gpui::Empty)) {
             window.update(cx, |_, cx| {
-                let response = cx.prompt(gpui::PromptLevel::Critical, "Zed failed to launch", Some(&format!("{}\n\nFor help resolving this, please open an issue on https://github.com/zed-industries/zed", e)), &["Exit"]);
+                let response = cx.prompt(gpui::PromptLevel::Critical, "Zed failed to launch", Some(&format!("{e}\n\nFor help resolving this, please open an issue on https://github.com/zed-industries/zed")), &["Exit"]);
 
                 cx.spawn(|_, mut cx| async move {
                     response.await?;
@@ -80,7 +80,9 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncAppContext) {
 }
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut AppContext) {
-    eprintln!("Zed failed to open a window: {:?}", e);
+    eprintln!(
+        "Zed failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
+    );
     #[cfg(not(target_os = "linux"))]
     {
         process::exit(1);
@@ -99,7 +101,12 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut AppContext) {
                 .add_notification(
                     notification_id,
                     Notification::new("Zed failed to launch")
-                        .body(Some(format!("{:?}", e).as_str()))
+                        .body(Some(
+                            format!(
+                                "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
+                            )
+                            .as_str(),
+                        ))
                         .priority(Priority::High)
                         .icon(ashpd::desktop::Icon::with_names(&[
                             "dialog-question-symbolic",
@@ -206,6 +213,7 @@ fn init_ui(app_state: Arc<AppState>, cx: &mut AppContext) -> Result<()> {
     markdown_preview::init(cx);
     welcome::init(cx);
     extensions_ui::init(cx);
+    snippet_provider::init(cx);
 
     // Initialize each completion provider. Settings are used for toggling between them.
     let copilot_language_server_id = app_state.languages.next_language_server_id();
@@ -219,9 +227,9 @@ fn init_ui(app_state: Arc<AppState>, cx: &mut AppContext) -> Result<()> {
 
     inline_completion_registry::init(app_state.client.telemetry().clone(), cx);
 
-    assistant::init(app_state.client.clone(), cx);
+    assistant::init(app_state.fs.clone(), app_state.client.clone(), cx);
 
-    repl::init(app_state.fs.clone(), cx);
+    repl::init(cx);
 
     cx.observe_global::<SettingsStore>({
         let languages = app_state.languages.clone();
@@ -707,8 +715,8 @@ fn init_logger() {
             Ok(log_file) => {
                 let mut config_builder = ConfigBuilder::new();
 
-                config_builder.set_time_format_str("%Y-%m-%dT%T%:z");
-                config_builder.set_time_to_local(true);
+                config_builder.set_time_format_rfc3339();
+                config_builder.set_time_offset_to_local().log_err();
 
                 #[cfg(target_os = "linux")]
                 {
@@ -751,7 +759,7 @@ fn init_stdout_logger() {
             )?;
             write!(buf, "{:<5}", buf.default_styled_level(record.level()))?;
             if let Some(path) = record.module_path() {
-                write!(buf, " {}", path)?;
+                write!(buf, " {path}")?;
             }
             write!(buf, "{}", subtle.value("]"))?;
             writeln!(buf, " {}", record.args())

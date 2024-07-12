@@ -276,6 +276,7 @@ impl EditorElement {
         register_action(view, cx, Editor::toggle_comments);
         register_action(view, cx, Editor::select_larger_syntax_node);
         register_action(view, cx, Editor::select_smaller_syntax_node);
+        register_action(view, cx, Editor::select_enclosing_symbol);
         register_action(view, cx, Editor::move_to_enclosing_bracket);
         register_action(view, cx, Editor::undo_selection);
         register_action(view, cx, Editor::redo_selection);
@@ -381,6 +382,7 @@ impl EditorElement {
                 cx.propagate();
             }
         });
+        register_action(view, cx, Editor::show_signature_help);
         register_action(view, cx, Editor::next_inline_completion);
         register_action(view, cx, Editor::previous_inline_completion);
         register_action(view, cx, Editor::show_inline_completion);
@@ -708,18 +710,24 @@ impl EditorElement {
         let Some(hub) = editor.collaboration_hub() else {
             return;
         };
-        let range = DisplayPoint::new(point.row(), point.column().saturating_sub(1))
-            ..DisplayPoint::new(
+        let start = snapshot.display_snapshot.clip_point(
+            DisplayPoint::new(point.row(), point.column().saturating_sub(1)),
+            Bias::Left,
+        );
+        let end = snapshot.display_snapshot.clip_point(
+            DisplayPoint::new(
                 point.row(),
                 (point.column() + 1).min(snapshot.line_len(point.row())),
-            );
+            ),
+            Bias::Right,
+        );
 
         let range = snapshot
             .buffer_snapshot
-            .anchor_at(range.start.to_point(&snapshot.display_snapshot), Bias::Left)
+            .anchor_at(start.to_point(&snapshot.display_snapshot), Bias::Left)
             ..snapshot
                 .buffer_snapshot
-                .anchor_at(range.end.to_point(&snapshot.display_snapshot), Bias::Right);
+                .anchor_at(end.to_point(&snapshot.display_snapshot), Bias::Right);
 
         let Some(selection) = snapshot.remote_selections_in_range(&range, hub, cx).next() else {
             return;
@@ -1118,11 +1126,12 @@ impl EditorElement {
             ScrollBeyondLastLine::Off => 1.0,
             ScrollBeyondLastLine::VerticalScrollMargin => 1.0 + settings.vertical_scroll_margin,
         };
-        let total_rows = snapshot.max_point().row().as_f32() + scroll_beyond_last_line;
+        let total_rows =
+            (snapshot.max_point().row().as_f32() + scroll_beyond_last_line).max(rows_per_page);
         let height = bounds.size.height;
         let px_per_row = height / total_rows;
         let thumb_height = (rows_per_page * px_per_row).max(ScrollbarLayout::MIN_THUMB_HEIGHT);
-        let row_height = (height - thumb_height) / (total_rows - rows_per_page).max(0.0);
+        let row_height = (height - thumb_height) / (total_rows - rows_per_page).max(0.);
 
         Some(ScrollbarLayout {
             hitbox: cx.insert_hitbox(track_bounds, false),
@@ -1830,10 +1839,10 @@ impl EditorElement {
     }
 
     fn layout_lines(
-        &self,
         rows: Range<DisplayRow>,
         line_number_layouts: &[Option<ShapedLine>],
         snapshot: &EditorSnapshot,
+        style: &EditorStyle,
         cx: &mut WindowContext,
     ) -> Vec<LineWithInvisibles> {
         if rows.start >= rows.end {
@@ -1842,7 +1851,7 @@ impl EditorElement {
 
         // Show the placeholder when the editor is empty
         if snapshot.is_empty() {
-            let font_size = self.style.text.font_size.to_pixels(cx.rem_size());
+            let font_size = style.text.font_size.to_pixels(cx.rem_size());
             let placeholder_color = cx.theme().colors().text_placeholder;
             let placeholder_text = snapshot.placeholder_text();
 
@@ -1857,7 +1866,7 @@ impl EditorElement {
                 .filter_map(move |line| {
                     let run = TextRun {
                         len: line.len(),
-                        font: self.style.text.font(),
+                        font: style.text.font(),
                         color: placeholder_color,
                         background_color: None,
                         underline: Default::default(),
@@ -1876,10 +1885,10 @@ impl EditorElement {
                 })
                 .collect()
         } else {
-            let chunks = snapshot.highlighted_chunks(rows.clone(), true, &self.style);
+            let chunks = snapshot.highlighted_chunks(rows.clone(), true, style);
             LineWithInvisibles::from_chunks(
                 chunks,
-                &self.style.text,
+                &style.text,
                 MAX_LINE_LEN,
                 rows.len(),
                 line_number_layouts,
@@ -2624,6 +2633,71 @@ impl EditorElement {
 
                 current_y = popover_origin.y + size.height + HOVER_POPOVER_GAP;
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_signature_help(
+        &self,
+        hitbox: &Hitbox,
+        content_origin: gpui::Point<Pixels>,
+        scroll_pixel_position: gpui::Point<Pixels>,
+        display_point: Option<DisplayPoint>,
+        start_row: DisplayRow,
+        line_layouts: &[LineWithInvisibles],
+        line_height: Pixels,
+        em_width: Pixels,
+        cx: &mut WindowContext,
+    ) {
+        let Some(display_point) = display_point else {
+            return;
+        };
+
+        let Some(cursor_row_layout) =
+            line_layouts.get(display_point.row().minus(start_row) as usize)
+        else {
+            return;
+        };
+
+        let start_x = cursor_row_layout.x_for_index(display_point.column() as usize)
+            - scroll_pixel_position.x
+            + content_origin.x;
+        let start_y =
+            display_point.row().as_f32() * line_height + content_origin.y - scroll_pixel_position.y;
+
+        let max_size = size(
+            (120. * em_width) // Default size
+                .min(hitbox.size.width / 2.) // Shrink to half of the editor width
+                .max(MIN_POPOVER_CHARACTER_WIDTH * em_width), // Apply minimum width of 20 characters
+            (16. * line_height) // Default size
+                .min(hitbox.size.height / 2.) // Shrink to half of the editor height
+                .max(MIN_POPOVER_LINE_HEIGHT * line_height), // Apply minimum height of 4 lines
+        );
+
+        let maybe_element = self.editor.update(cx, |editor, cx| {
+            if let Some(popover) = editor.signature_help_state.popover_mut() {
+                let element = popover.render(
+                    &self.style,
+                    max_size,
+                    editor.workspace.as_ref().map(|(w, _)| w.clone()),
+                    cx,
+                );
+                Some(element)
+            } else {
+                None
+            }
+        });
+        if let Some(mut element) = maybe_element {
+            let window_size = cx.viewport_size();
+            let size = element.layout_as_root(Size::<AvailableSpace>::default(), cx);
+            let mut point = point(start_x, start_y - size.height);
+
+            // Adjusting to ensure the popover does not overflow in the X-axis direction.
+            if point.x + size.width >= window_size.width {
+                point.x = window_size.width - size.width;
+            }
+
+            cx.defer_draw(element, point, 1)
         }
     }
 
@@ -3658,6 +3732,11 @@ impl EditorElement {
                         if scroll_position != current_scroll_position {
                             editor.scroll(scroll_position, axis, cx);
                             cx.stop_propagation();
+                        } else if y < 0. {
+                            // Due to clamping, we may fail to detect cases of overscroll to the top;
+                            // We want the scroll manager to get an update in such cases and detect the change of direction
+                            // on the next frame.
+                            cx.notify();
                         }
                     });
                 }
@@ -3727,6 +3806,9 @@ impl EditorElement {
             move |event: &MouseMoveEvent, phase, cx| {
                 if phase == DispatchPhase::Bubble {
                     editor.update(cx, |editor, cx| {
+                        if editor.hover_state.focused(cx) {
+                            return;
+                        }
                         if event.pressed_button == Some(MouseButton::Left)
                             || event.pressed_button == Some(MouseButton::Middle)
                         {
@@ -4474,7 +4556,7 @@ impl EditorElement {
             // We currently use single-line and auto-height editors in UI contexts,
             // so we don't want to scale everything with the buffer font size, as it
             // ends up looking off.
-            EditorMode::SingleLine | EditorMode::AutoHeight { .. } => None,
+            EditorMode::SingleLine { .. } | EditorMode::AutoHeight { .. } => None,
         }
     }
 }
@@ -4498,12 +4580,43 @@ impl Element for EditorElement {
                 editor.set_style(self.style.clone(), cx);
 
                 let layout_id = match editor.mode {
-                    EditorMode::SingleLine => {
+                    EditorMode::SingleLine { auto_width } => {
                         let rem_size = cx.rem_size();
-                        let mut style = Style::default();
-                        style.size.width = relative(1.).into();
-                        style.size.height = self.style.text.line_height_in_pixels(rem_size).into();
-                        cx.request_layout(style, None)
+
+                        let height = self.style.text.line_height_in_pixels(rem_size);
+                        if auto_width {
+                            let editor_handle = cx.view().clone();
+                            let style = self.style.clone();
+                            cx.request_measured_layout(Style::default(), move |_, _, cx| {
+                                let editor_snapshot =
+                                    editor_handle.update(cx, |editor, cx| editor.snapshot(cx));
+                                let line = Self::layout_lines(
+                                    DisplayRow(0)..DisplayRow(1),
+                                    &[],
+                                    &editor_snapshot,
+                                    &style,
+                                    cx,
+                                )
+                                .pop()
+                                .unwrap();
+
+                                let font_id = cx.text_system().resolve_font(&style.text.font());
+                                let font_size = style.text.font_size.to_pixels(cx.rem_size());
+                                let em_width = cx
+                                    .text_system()
+                                    .typographic_bounds(font_id, font_size, 'm')
+                                    .unwrap()
+                                    .size
+                                    .width;
+
+                                size(line.width + em_width, height)
+                            })
+                        } else {
+                            let mut style = Style::default();
+                            style.size.height = height.into();
+                            style.size.width = relative(1.).into();
+                            cx.request_layout(style, None)
+                        }
                     }
                     EditorMode::AutoHeight { max_lines } => {
                         let editor_handle = cx.view().clone();
@@ -4644,17 +4757,17 @@ impl Element for EditorElement {
                         text_hitbox.origin + point(gutter_dimensions.margin, Pixels::ZERO);
 
                     let height_in_lines = bounds.size.height / line_height;
+                    let max_row = snapshot.max_point().row().as_f32();
                     let max_scroll_top = if matches!(snapshot.mode, EditorMode::AutoHeight { .. }) {
-                        (snapshot.max_point().row().as_f32() - height_in_lines + 1.).max(0.)
+                        (max_row - height_in_lines + 1.).max(0.)
                     } else {
                         let settings = EditorSettings::get_global(cx);
-                        let max_row = snapshot.max_point().row().as_f32();
                         match settings.scroll_beyond_last_line {
                             ScrollBeyondLastLine::OnePage => max_row,
-                            ScrollBeyondLastLine::Off => (max_row - height_in_lines + 1.0).max(0.0),
+                            ScrollBeyondLastLine::Off => (max_row - height_in_lines + 1.).max(0.),
                             ScrollBeyondLastLine::VerticalScrollMargin => {
-                                (max_row - height_in_lines + 1.0 + settings.vertical_scroll_margin)
-                                    .max(0.0)
+                                (max_row - height_in_lines + 1. + settings.vertical_scroll_margin)
+                                    .max(0.)
                             }
                         }
                     };
@@ -4762,8 +4875,13 @@ impl Element for EditorElement {
                     );
 
                     let mut max_visible_line_width = Pixels::ZERO;
-                    let mut line_layouts =
-                        self.layout_lines(start_row..end_row, &line_numbers, &snapshot, cx);
+                    let mut line_layouts = Self::layout_lines(
+                        start_row..end_row,
+                        &line_numbers,
+                        &snapshot,
+                        &self.style,
+                        cx,
+                    );
                     for line_with_invisibles in &line_layouts {
                         if line_with_invisibles.width > max_visible_line_width {
                             max_visible_line_width = line_with_invisibles.width;
@@ -4791,15 +4909,42 @@ impl Element for EditorElement {
                         )
                     });
 
-                    let scroll_pixel_position = point(
-                        scroll_position.x * em_width,
-                        scroll_position.y * line_height,
-                    );
-
                     let start_buffer_row =
                         MultiBufferRow(start_anchor.to_point(&snapshot.buffer_snapshot).row);
                     let end_buffer_row =
                         MultiBufferRow(end_anchor.to_point(&snapshot.buffer_snapshot).row);
+
+                    let scroll_max = point(
+                        ((scroll_width - text_hitbox.size.width) / em_width).max(0.0),
+                        max_row.as_f32(),
+                    );
+
+                    self.editor.update(cx, |editor, cx| {
+                        let clamped = editor.scroll_manager.clamp_scroll_left(scroll_max.x);
+
+                        let autoscrolled = if autoscroll_horizontally {
+                            editor.autoscroll_horizontally(
+                                start_row,
+                                text_hitbox.size.width,
+                                scroll_width,
+                                em_width,
+                                &line_layouts,
+                                cx,
+                            )
+                        } else {
+                            false
+                        };
+
+                        if clamped || autoscrolled {
+                            snapshot = editor.snapshot(cx);
+                            scroll_position = snapshot.scroll_position();
+                        }
+                    });
+
+                    let scroll_pixel_position = point(
+                        scroll_position.x * em_width,
+                        scroll_position.y * line_height,
+                    );
 
                     let indent_guides = self.layout_indent_guides(
                         content_origin,
@@ -4992,6 +5137,18 @@ impl Element for EditorElement {
                     } else {
                         vec![]
                     };
+
+                    self.layout_signature_help(
+                        &hitbox,
+                        content_origin,
+                        scroll_pixel_position,
+                        newest_selection_head,
+                        start_row,
+                        &line_layouts,
+                        line_height,
+                        em_width,
+                        cx,
+                    );
 
                     if !cx.has_active_drag() {
                         self.layout_hover_popovers(
@@ -6064,7 +6221,7 @@ mod tests {
         });
 
         for editor_mode_without_invisibles in [
-            EditorMode::SingleLine,
+            EditorMode::SingleLine { auto_width: false },
             EditorMode::AutoHeight { max_lines: 100 },
         ] {
             let invisibles = collect_invisibles_from_new_editor(
