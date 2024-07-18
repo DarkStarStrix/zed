@@ -1,4 +1,5 @@
 use crate::editor_settings::ScrollBeyondLastLine;
+use crate::TransformBlockId;
 use crate::{
     blame_entry_tooltip::{blame_entry_relative_timestamp, BlameEntryTooltip},
     display_map::{
@@ -31,7 +32,7 @@ use gpui::{
     anchored, deferred, div, fill, outline, point, px, quad, relative, size, svg,
     transparent_black, Action, AnchorCorner, AnyElement, AvailableSpace, Bounds, ClipboardItem,
     ContentMask, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementInputHandler, Entity,
-    FontId, GlobalElementId, Hitbox, Hsla, InteractiveElement, IntoElement, Length,
+    EntityId, FontId, GlobalElementId, Hitbox, Hsla, InteractiveElement, IntoElement, Length,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     ParentElement, Pixels, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size,
     StatefulInteractiveElement, Style, Styled, TextRun, TextStyle, TextStyleRefinement, View,
@@ -408,8 +409,10 @@ impl EditorElement {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-
                 editor.update(cx, |editor, cx| {
+                    if editor.hover_state.focused(cx) {
+                        return;
+                    }
                     Self::modifiers_changed(editor, event, &position_map, &text_hitbox, cx)
                 })
             }
@@ -1937,7 +1940,6 @@ impl EditorElement {
         line_layouts: &[LineWithInvisibles],
         cx: &mut WindowContext,
     ) -> Vec<BlockLayout> {
-        let mut block_id = 0;
         let (fixed_blocks, non_fixed_blocks) = snapshot
             .blocks_in_range(rows.clone())
             .partition::<Vec<_>, _>(|(_, block)| match block {
@@ -1948,7 +1950,7 @@ impl EditorElement {
 
         let render_block = |block: &TransformBlock,
                             available_space: Size<AvailableSpace>,
-                            block_id: usize,
+                            block_id: TransformBlockId,
                             block_row_start: DisplayRow,
                             cx: &mut WindowContext| {
             let mut element = match block {
@@ -1972,7 +1974,7 @@ impl EditorElement {
                         gutter_dimensions,
                         line_height,
                         em_width,
-                        block_id,
+                        transform_block_id: block_id,
                         max_width: text_hitbox.size.width.max(*scroll_width),
                         editor_style: &self.style,
                     })
@@ -2056,7 +2058,7 @@ impl EditorElement {
                         let header_padding = px(6.0);
 
                         v_flex()
-                            .id(("path excerpt header", block_id))
+                            .id(("path excerpt header", EntityId::from(block_id)))
                             .size_full()
                             .p(header_padding)
                             .child(
@@ -2090,8 +2092,9 @@ impl EditorElement {
                                                 }),
                                         ),
                                     )
-                                    .when_some(jump_data.clone(), |this, jump_data| {
-                                        this.cursor_pointer()
+                                    .when_some(jump_data.clone(), |el, jump_data| {
+                                        el.child(Icon::new(IconName::ArrowUpRight))
+                                            .cursor_pointer()
                                             .tooltip(|cx| {
                                                 Tooltip::for_action(
                                                     "Jump to File",
@@ -2164,7 +2167,7 @@ impl EditorElement {
                             }))
                     } else {
                         v_flex()
-                            .id(("excerpt header", block_id))
+                            .id(("excerpt header", EntityId::from(block_id)))
                             .size_full()
                             .child(
                                 div()
@@ -2312,49 +2315,54 @@ impl EditorElement {
                 }
 
                 TransformBlock::ExcerptFooter { id, .. } => {
-                    let element = v_flex().id(("excerpt footer", block_id)).size_full().child(
-                        h_flex()
-                            .justify_end()
-                            .flex_none()
-                            .w(gutter_dimensions.width
-                                - (gutter_dimensions.left_padding + gutter_dimensions.margin))
-                            .h_full()
-                            .child(
-                                ButtonLike::new("expand-icon")
-                                    .style(ButtonStyle::Transparent)
-                                    .child(
-                                        svg()
-                                            .path(IconName::ArrowDownFromLine.path())
-                                            .size(IconSize::XSmall.rems())
-                                            .text_color(cx.theme().colors().editor_line_number)
-                                            .group("")
-                                            .hover(|style| {
-                                                style.text_color(
-                                                    cx.theme().colors().editor_active_line_number,
+                    let element = v_flex()
+                        .id(("excerpt footer", EntityId::from(block_id)))
+                        .size_full()
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .flex_none()
+                                .w(gutter_dimensions.width
+                                    - (gutter_dimensions.left_padding + gutter_dimensions.margin))
+                                .h_full()
+                                .child(
+                                    ButtonLike::new("expand-icon")
+                                        .style(ButtonStyle::Transparent)
+                                        .child(
+                                            svg()
+                                                .path(IconName::ArrowDownFromLine.path())
+                                                .size(IconSize::XSmall.rems())
+                                                .text_color(cx.theme().colors().editor_line_number)
+                                                .group("")
+                                                .hover(|style| {
+                                                    style.text_color(
+                                                        cx.theme()
+                                                            .colors()
+                                                            .editor_active_line_number,
+                                                    )
+                                                }),
+                                        )
+                                        .on_click(cx.listener_for(&self.editor, {
+                                            let id = *id;
+                                            move |editor, _, cx| {
+                                                editor.expand_excerpt(
+                                                    id,
+                                                    multi_buffer::ExpandExcerptDirection::Down,
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                        .tooltip({
+                                            move |cx| {
+                                                Tooltip::for_action(
+                                                    "Expand Excerpt",
+                                                    &ExpandExcerpts { lines: 0 },
+                                                    cx,
                                                 )
-                                            }),
-                                    )
-                                    .on_click(cx.listener_for(&self.editor, {
-                                        let id = *id;
-                                        move |editor, _, cx| {
-                                            editor.expand_excerpt(
-                                                id,
-                                                multi_buffer::ExpandExcerptDirection::Down,
-                                                cx,
-                                            );
-                                        }
-                                    }))
-                                    .tooltip({
-                                        move |cx| {
-                                            Tooltip::for_action(
-                                                "Expand Excerpt",
-                                                &ExpandExcerpts { lines: 0 },
-                                                cx,
-                                            )
-                                        }
-                                    }),
-                            ),
-                    );
+                                            }
+                                        }),
+                                ),
+                        );
                     element.into_any()
                 }
             };
@@ -2370,8 +2378,8 @@ impl EditorElement {
                 AvailableSpace::MinContent,
                 AvailableSpace::Definite(block.height() as f32 * line_height),
             );
+            let block_id = block.id();
             let (element, element_size) = render_block(block, available_space, block_id, row, cx);
-            block_id += 1;
             fixed_block_max_width = fixed_block_max_width.max(element_size.width + em_width);
             blocks.push(BlockLayout {
                 row,
@@ -2399,8 +2407,8 @@ impl EditorElement {
                 AvailableSpace::Definite(width),
                 AvailableSpace::Definite(block.height() as f32 * line_height),
             );
+            let block_id = block.id();
             let (element, _) = render_block(block, available_space, block_id, row, cx);
-            block_id += 1;
             blocks.push(BlockLayout {
                 row,
                 element,
@@ -2642,28 +2650,30 @@ impl EditorElement {
         hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
         scroll_pixel_position: gpui::Point<Pixels>,
-        display_point: Option<DisplayPoint>,
+        newest_selection_head: Option<DisplayPoint>,
         start_row: DisplayRow,
         line_layouts: &[LineWithInvisibles],
         line_height: Pixels,
         em_width: Pixels,
         cx: &mut WindowContext,
     ) {
-        let Some(display_point) = display_point else {
+        let Some(newest_selection_head) = newest_selection_head else {
             return;
         };
-
-        let Some(cursor_row_layout) =
-            line_layouts.get(display_point.row().minus(start_row) as usize)
+        let selection_row = newest_selection_head.row();
+        if selection_row < start_row {
+            return;
+        }
+        let Some(cursor_row_layout) = line_layouts.get(selection_row.minus(start_row) as usize)
         else {
             return;
         };
 
-        let start_x = cursor_row_layout.x_for_index(display_point.column() as usize)
+        let start_x = cursor_row_layout.x_for_index(newest_selection_head.column() as usize)
             - scroll_pixel_position.x
             + content_origin.x;
         let start_y =
-            display_point.row().as_f32() * line_height + content_origin.y - scroll_pixel_position.y;
+            selection_row.as_f32() * line_height + content_origin.y - scroll_pixel_position.y;
 
         let max_size = size(
             (120. * em_width) // Default size
@@ -3913,7 +3923,7 @@ fn render_inline_blame_entry(
     workspace: Option<WeakView<Workspace>>,
     cx: &mut WindowContext<'_>,
 ) -> AnyElement {
-    let relative_timestamp = blame_entry_relative_timestamp(&blame_entry, cx);
+    let relative_timestamp = blame_entry_relative_timestamp(&blame_entry);
 
     let author = blame_entry.author.as_deref().unwrap_or_default();
     let text = format!("{}, {}", author, relative_timestamp);
@@ -3959,7 +3969,7 @@ fn render_blame_entry(
     };
     last_used_color.replace((sha_color, blame_entry.sha));
 
-    let relative_timestamp = blame_entry_relative_timestamp(&blame_entry, cx);
+    let relative_timestamp = blame_entry_relative_timestamp(&blame_entry);
 
     let short_commit_id = blame_entry.sha.display_short();
 

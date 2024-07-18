@@ -68,12 +68,12 @@ use git::diff_hunk_to_display;
 use gpui::{
     div, impl_actions, point, prelude::*, px, relative, size, uniform_list, Action, AnyElement,
     AppContext, AsyncWindowContext, AvailableSpace, BackgroundExecutor, Bounds, ClipboardItem,
-    Context, DispatchPhase, ElementId, EventEmitter, FocusHandle, FocusOutEvent, FocusableView,
-    FontId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText, KeyContext,
-    ListSizingBehavior, Model, MouseButton, PaintQuad, ParentElement, Pixels, Render, SharedString,
-    Size, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextStyle, UnderlineStyle,
-    UniformListScrollHandle, View, ViewContext, ViewInputHandler, VisualContext, WeakFocusHandle,
-    WeakView, WhiteSpace, WindowContext,
+    Context, DispatchPhase, ElementId, EntityId, EventEmitter, FocusHandle, FocusOutEvent,
+    FocusableView, FontId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText,
+    KeyContext, ListSizingBehavior, Model, MouseButton, PaintQuad, ParentElement, Pixels, Render,
+    SharedString, Size, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextStyle,
+    UnderlineStyle, UniformListScrollHandle, View, ViewContext, ViewInputHandler, VisualContext,
+    WeakFocusHandle, WeakView, WhiteSpace, WindowContext,
 };
 use highlight_matching_bracket::refresh_matching_bracket_highlights;
 use hover_popover::{hide_hover, HoverState};
@@ -131,7 +131,7 @@ use std::{
     mem,
     num::NonZeroU32,
     ops::{ControlFlow, Deref, DerefMut, Not as _, Range, RangeInclusive},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -271,8 +271,9 @@ pub fn init(cx: &mut AppContext) {
     init_settings(cx);
 
     workspace::register_project_item::<Editor>(cx);
-    workspace::register_followable_item::<Editor>(cx);
-    workspace::register_deserializable_item::<Editor>(cx);
+    workspace::FollowableViewRegistry::register::<Editor>(cx);
+    workspace::register_serializable_item::<Editor>(cx);
+
     cx.observe_new_views(
         |workspace: &mut Workspace, _cx: &mut ViewContext<Workspace>| {
             workspace.register_action(Editor::new_file);
@@ -550,6 +551,7 @@ pub struct Editor {
     show_git_blame_inline: bool,
     show_git_blame_inline_delay_task: Option<Task<()>>,
     git_blame_inline_enabled: bool,
+    serialize_dirty_buffers: bool,
     show_selection_menu: Option<bool>,
     blame: Option<Model<GitBlame>>,
     blame_subscription: Option<Subscription>,
@@ -1770,6 +1772,8 @@ impl Editor {
         );
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, Self::handle_focus).detach();
+        cx.on_focus_in(&focus_handle, Self::handle_focus_in)
+            .detach();
         cx.on_focus_out(&focus_handle, Self::handle_focus_out)
             .detach();
         cx.on_blur(&focus_handle, Self::handle_blur).detach();
@@ -1874,6 +1878,9 @@ impl Editor {
             show_selection_menu: None,
             show_git_blame_inline_delay_task: None,
             git_blame_inline_enabled: ProjectSettings::get_global(cx).git.inline_blame_enabled(),
+            serialize_dirty_buffers: ProjectSettings::get_global(cx)
+                .session
+                .restore_unsaved_buffers,
             blame: None,
             blame_subscription: None,
             file_header_size,
@@ -3631,7 +3638,7 @@ impl Editor {
         if self.is_completion_trigger(text, trigger_in_words, cx) {
             self.show_completions(
                 &ShowCompletions {
-                    trigger: text.chars().last(),
+                    trigger: Some(text.to_owned()).filter(|x| !x.is_empty()),
                 },
                 cx,
             );
@@ -4055,15 +4062,18 @@ impl Editor {
                 Some(ContextMenu::Completions(_))
             )
         };
-        let trigger_kind = match (options.trigger, is_followup_invoke) {
+        let trigger_kind = match (&options.trigger, is_followup_invoke) {
             (_, true) => CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
-            (Some(_), _) => CompletionTriggerKind::TRIGGER_CHARACTER,
+            (Some(trigger), _) if buffer.read(cx).completion_triggers().contains(&trigger) => {
+                CompletionTriggerKind::TRIGGER_CHARACTER
+            }
+
             _ => CompletionTriggerKind::INVOKED,
         };
         let completion_context = CompletionContext {
-            trigger_character: options.trigger.and_then(|c| {
+            trigger_character: options.trigger.as_ref().and_then(|trigger| {
                 if trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER {
-                    Some(String::from(c))
+                    Some(String::from(trigger))
                 } else {
                     None
                 }
@@ -8529,7 +8539,7 @@ impl Editor {
     ) -> Vec<(TaskSourceKind, TaskTemplate)> {
         let (inventory, worktree_id, file) = project.read_with(cx, |project, cx| {
             let (worktree_id, file) = project
-                .buffer_for_id(runnable.buffer)
+                .buffer_for_id(runnable.buffer, cx)
                 .and_then(|buffer| buffer.read(cx).file())
                 .map(|file| (WorktreeId::from_usize(file.worktree_id()), file.clone()))
                 .unzip();
@@ -9489,6 +9499,11 @@ impl Editor {
                         }
                         editor
                     });
+                    cx.subscribe(&rename_editor, |_, _, e, cx| match e {
+                        EditorEvent::Focused => cx.emit(EditorEvent::FocusedIn),
+                        _ => {}
+                    })
+                    .detach();
 
                     let write_highlights =
                         this.clear_background_highlights::<DocumentHighlightWrite>(cx);
@@ -9762,7 +9777,7 @@ impl Editor {
                         *block_id,
                         (
                             None,
-                            diagnostic_block_renderer(diagnostic.clone(), is_valid),
+                            diagnostic_block_renderer(diagnostic.clone(), None, true, is_valid),
                         ),
                     );
                 }
@@ -9815,7 +9830,7 @@ impl Editor {
                             style: BlockStyle::Fixed,
                             position: buffer.anchor_after(entry.range.start),
                             height: message_height,
-                            render: diagnostic_block_renderer(diagnostic, true),
+                            render: diagnostic_block_renderer(diagnostic, None, true, true),
                             disposition: BlockDisposition::Below,
                         }
                     }),
@@ -10372,6 +10387,22 @@ impl Editor {
     pub fn set_show_indent_guides(&mut self, show_indent_guides: bool, cx: &mut ViewContext<Self>) {
         self.show_indent_guides = Some(show_indent_guides);
         cx.notify();
+    }
+
+    pub fn working_directory(&self, cx: &WindowContext) -> Option<PathBuf> {
+        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
+            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
+                if let Some(dir) = file.abs_path(cx).parent() {
+                    return Some(dir.to_owned());
+                }
+            }
+
+            if let Some(project_path) = buffer.read(cx).project_path(cx) {
+                return Some(project_path.path.to_path_buf());
+            }
+        }
+
+        None
     }
 
     pub fn reveal_in_finder(&mut self, _: &RevealInFileManager, cx: &mut ViewContext<Self>) {
@@ -11243,8 +11274,11 @@ impl Editor {
         self.scroll_manager.vertical_scroll_margin = editor_settings.vertical_scroll_margin;
         self.show_breadcrumbs = editor_settings.toolbar.breadcrumbs;
 
+        let project_settings = ProjectSettings::get_global(cx);
+        self.serialize_dirty_buffers = project_settings.session.restore_unsaved_buffers;
+
         if self.mode == EditorMode::Full {
-            let inline_blame_enabled = ProjectSettings::get_global(cx).git.inline_blame_enabled();
+            let inline_blame_enabled = project_settings.git.inline_blame_enabled();
             if self.git_blame_inline_enabled != inline_blame_enabled {
                 self.toggle_git_blame_inline_internal(false, cx);
             }
@@ -11630,6 +11664,10 @@ impl Editor {
                 }
             });
         }
+    }
+
+    fn handle_focus_in(&mut self, cx: &mut ViewContext<Self>) {
+        cx.emit(EditorEvent::FocusedIn)
     }
 
     fn handle_focus_out(&mut self, event: FocusOutEvent, _cx: &mut ViewContext<Self>) {
@@ -12236,6 +12274,7 @@ pub enum EditorEvent {
     },
     Reparsed(BufferId),
     Focused,
+    FocusedIn,
     Blurred,
     DirtyChanged,
     Saved,
@@ -12684,11 +12723,17 @@ impl InvalidationRegion for SnippetState {
     }
 }
 
-pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> RenderBlock {
-    let (text_without_backticks, code_ranges) = highlight_diagnostic_message(&diagnostic);
+pub fn diagnostic_block_renderer(
+    diagnostic: Diagnostic,
+    max_message_rows: Option<u8>,
+    allow_closing: bool,
+    _is_valid: bool,
+) -> RenderBlock {
+    let (text_without_backticks, code_ranges) =
+        highlight_diagnostic_message(&diagnostic, max_message_rows);
 
     Box::new(move |cx: &mut BlockContext| {
-        let group_id: SharedString = cx.block_id.to_string().into();
+        let group_id: SharedString = cx.transform_block_id.to_string().into();
 
         let mut text_style = cx.text_style().clone();
         text_style.color = diagnostic_style(diagnostic.severity, cx.theme().status());
@@ -12700,23 +12745,25 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
 
         let multi_line_diagnostic = diagnostic.message.contains('\n');
 
-        let buttons = |diagnostic: &Diagnostic, block_id: usize| {
+        let buttons = |diagnostic: &Diagnostic, block_id: TransformBlockId| {
             if multi_line_diagnostic {
                 v_flex()
             } else {
                 h_flex()
             }
-            .children(diagnostic.is_primary.then(|| {
-                IconButton::new(("close-block", block_id), IconName::XCircle)
-                    .icon_color(Color::Muted)
-                    .size(ButtonSize::Compact)
-                    .style(ButtonStyle::Transparent)
-                    .visible_on_hover(group_id.clone())
-                    .on_click(move |_click, cx| cx.dispatch_action(Box::new(Cancel)))
-                    .tooltip(|cx| Tooltip::for_action("Close Diagnostics", &Cancel, cx))
-            }))
+            .when(allow_closing, |div| {
+                div.children(diagnostic.is_primary.then(|| {
+                    IconButton::new(("close-block", EntityId::from(block_id)), IconName::XCircle)
+                        .icon_color(Color::Muted)
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Transparent)
+                        .visible_on_hover(group_id.clone())
+                        .on_click(move |_click, cx| cx.dispatch_action(Box::new(Cancel)))
+                        .tooltip(|cx| Tooltip::for_action("Close Diagnostics", &Cancel, cx))
+                }))
+            })
             .child(
-                IconButton::new(("copy-block", block_id), IconName::Copy)
+                IconButton::new(("copy-block", EntityId::from(block_id)), IconName::Copy)
                     .icon_color(Color::Muted)
                     .size(ButtonSize::Compact)
                     .style(ButtonStyle::Transparent)
@@ -12729,12 +12776,12 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
             )
         };
 
-        let icon_size = buttons(&diagnostic, cx.block_id)
+        let icon_size = buttons(&diagnostic, cx.transform_block_id)
             .into_any_element()
             .layout_as_root(AvailableSpace::min_size(), cx);
 
         h_flex()
-            .id(cx.block_id)
+            .id(cx.transform_block_id)
             .group(group_id.clone())
             .relative()
             .size_full()
@@ -12746,7 +12793,7 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
                     .w(cx.anchor_x - cx.gutter_dimensions.width - icon_size.width)
                     .flex_shrink(),
             )
-            .child(buttons(&diagnostic, cx.block_id))
+            .child(buttons(&diagnostic, cx.transform_block_id))
             .child(div().flex().flex_shrink_0().child(
                 StyledText::new(text_without_backticks.clone()).with_highlights(
                     &text_style,
@@ -12765,7 +12812,10 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
     })
 }
 
-pub fn highlight_diagnostic_message(diagnostic: &Diagnostic) -> (SharedString, Vec<Range<usize>>) {
+pub fn highlight_diagnostic_message(
+    diagnostic: &Diagnostic,
+    mut max_message_rows: Option<u8>,
+) -> (SharedString, Vec<Range<usize>>) {
     let mut text_without_backticks = String::new();
     let mut code_ranges = Vec::new();
 
@@ -12777,18 +12827,53 @@ pub fn highlight_diagnostic_message(diagnostic: &Diagnostic) -> (SharedString, V
 
     let mut prev_offset = 0;
     let mut in_code_block = false;
-    for (ix, _) in diagnostic
+    let has_row_limit = max_message_rows.is_some();
+    let mut newline_indices = diagnostic
+        .message
+        .match_indices('\n')
+        .filter(|_| has_row_limit)
+        .map(|(ix, _)| ix)
+        .fuse()
+        .peekable();
+
+    for (quote_ix, _) in diagnostic
         .message
         .match_indices('`')
         .chain([(diagnostic.message.len(), "")])
     {
+        let mut first_newline_ix = None;
+        let mut last_newline_ix = None;
+        while let Some(newline_ix) = newline_indices.peek() {
+            if *newline_ix < quote_ix {
+                if first_newline_ix.is_none() {
+                    first_newline_ix = Some(*newline_ix);
+                }
+                last_newline_ix = Some(*newline_ix);
+
+                if let Some(rows_left) = &mut max_message_rows {
+                    if *rows_left == 0 {
+                        break;
+                    } else {
+                        *rows_left -= 1;
+                    }
+                }
+                let _ = newline_indices.next();
+            } else {
+                break;
+            }
+        }
         let prev_len = text_without_backticks.len();
-        text_without_backticks.push_str(&diagnostic.message[prev_offset..ix]);
-        prev_offset = ix + 1;
+        let new_text = &diagnostic.message[prev_offset..first_newline_ix.unwrap_or(quote_ix)];
+        text_without_backticks.push_str(new_text);
         if in_code_block {
             code_ranges.push(prev_len..text_without_backticks.len());
         }
+        prev_offset = last_newline_ix.unwrap_or(quote_ix) + 1;
         in_code_block = !in_code_block;
+        if first_newline_ix.map_or(false, |newline_ix| newline_ix < quote_ix) {
+            text_without_backticks.push_str("...");
+            break;
+        }
     }
 
     (text_without_backticks.into(), code_ranges)
